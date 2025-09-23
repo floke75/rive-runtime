@@ -1,47 +1,82 @@
-# Rive Runtime Windows Navigation Guide
+# Rive Runtime Windows Contributor Guide
 
-This guide orients coding agents that need to build or extend the repository on Windows, with an emphasis on producing a test application that opens `.riv` files successfully.
+This guide documents the Windows-specific parts of the C++ runtime that
+contributors interact with, including repository entry points, setup steps,
+build workflows, and testing or sample runners.
 
-## 1. Build & Environment Overview
-- **Toolchain.** Install Visual Studio 2022 with **Desktop development with C++**, the Windows 10/11 SDKs, and `fxc`. Community edition works; the helper scripts detect `VsDevCmd`/`VsDevShell` if `fxc` is missing.【F:build/setup_windows_dev.bat†L1-L18】【F:build/setup_windows_dev.ps1†L1-L23】 Use Git Bash so that GNU tools (`bash`, `make`) required by shader and dependency scripts are available on `PATH`.【f78651†L6-L31】
-- **Launch sequence.** From a Git Bash prompt, start `cmd`, then execute `build\setup_windows_dev.bat` to enter an MSVC developer shell with Unix tools still on `PATH` and the repo build scripts pre-pended. Running the batch file directly from Bash fails because it expects `cmd.exe` semantics.【f78651†L24-L56】
-- **Entry point.** With the developer shell active, invoke `build\build_rive.bat` (or `.ps1`); both wrap `build_rive.sh`, configuring Premake before dispatching to `msbuild`. For renderer examples, change into `renderer` and call `build_rive.bat release clean --with_vulkan` as demonstrated in the upstream Windows thread.【F:build/build_rive.bat†L1-L8】【F:build/build_rive.ps1†L1-L10】【f78651†L62-L77】
-- **GLFW dependency.** Before launching the renderer build, change to `skia\dependencies` and run `bash make_glfw.sh` to install GLFW, which DirectX samples link against.【f78651†L57-L70】
-- **Premake workflow.** `build_rive.sh` detects Windows hosts, selects the `vs2022` generator, caches premake arguments in `out/<config>/.rive_premake_args`, and invokes `msbuild` on the generated solution. Pass extra premake flags (e.g., `--with_rive_text`) directly to `build_rive.sh` to toggle runtime features.【F:build/build_rive.sh†L71-L204】【F:build/build_rive.sh†L206-L337】
-- **Repository structure.** Top-level `premake5_v2.lua` configures the core static library and shared options (text/layout/audio flags). Downstream projects import this configuration file before adding platform-specific targets.【F:premake5_v2.lua†L1-L102】
+## Windows prerequisites
+- Install Visual Studio 2022 with the Desktop development with C++ workload so
+the build scripts can call the Developer Command Prompt/PowerShell shortcuts
+and access the Direct3D compiler (`fxc`).【F:build/setup_windows_dev.bat†L1-L18】【F:build/setup_windows_dev.ps1†L1-L23】
+- Install Git for Windows (Git Bash) so the batch/PowerShell wrappers can invoke
+`sh build_rive.sh` and other POSIX shell scripts without manual environment
+setup.【F:build/build_rive.bat†L1-L8】【F:build/build_rive.ps1†L1-L11】
+- Ensure CMake is available (bundled with Visual Studio 2022) before building
+the bundled GLFW dependency used by the Windows samples.【F:skia/dependencies/make_glfw.sh†L1-L25】
 
-## 2. Core Runtime Layout
-- **Public headers.** `include/rive` exposes artboards, animation/state machines, renderer abstractions, layout, text, audio, data-binding, and view model APIs consumed by apps and tools.【F:include/rive/renderer.hpp†L1-L120】【F:include/rive/renderer.hpp†L133-L199】
-- **Source code.** `src/` mirrors the header tree; key entry points include `file.cpp` for `.riv` import, artboard/runtime data structures, command queues, layout, scripting, audio, etc.【F:src/file.cpp†L1-L200】【F:src/file.cpp†L171-L199】
-- **Decoders & utilities.** `decoders/` wraps PNG/JPEG/WebP loaders; `utils/` hosts fallback factories (e.g., `no_op_factory`). Include these via Premake when tools need image decoding or software fallbacks.【F:decoders/premake5_v2.lua†L1-L80】【F:utils/no_op_factory.cpp†L1-L120】
+## Key directories and entry points
+- `premake5_v2.lua` defines feature toggles (text, layout, scripting, audio) and
+applies the Windows static-library configuration for the core `rive` target that
+Visual Studio solutions consume.【F:premake5_v2.lua†L3-L164】
+- Public headers in `include/rive`, such as the renderer interface in
+`renderer.hpp`, expose the rendering, math, and animation APIs that Windows
+clients link against.【F:include/rive/renderer.hpp†L5-L155】
+- Runtime implementation sources under `src/` import `.riv` files, instantiate
+artboards/state machines, and surface data-binding helpers consumed by Windows
+apps.【F:src/file.cpp†L1-L159】
+- The Direct3D backends live in `renderer/include/rive/renderer/d3d11` and
+`renderer/include/rive/renderer/d3d12`, detailing render-target ownership,
+pipeline state, and resource helpers for Windows GPU workloads.【F:renderer/include/rive/renderer/d3d11/render_context_d3d_impl.hpp†L5-L170】【F:renderer/include/rive/renderer/d3d12/render_context_d3d12_impl.hpp†L5-L160】
+- `renderer/premake5.lua` wires Windows samples (for example, `path_fiddle`) to
+GLFW, Direct3D libraries, and optional Skia/Dawn integrations while enabling the
+runtime feature toggles selected during generation.【F:renderer/premake5.lua†L1-L176】
+- The shared `TestingWindow` abstraction in `tests/common/testing_window.hpp`
+exposes Direct3D 11/12 backends plus utility hooks for Windows-focused renderer
+and sample tests.【F:tests/common/testing_window.hpp†L5-L199】
+- Sample runners like `tests/player/player.cpp` demonstrate how Windows targets
+obtain a `TestingWindow`, load `.riv` files, and drive animation update loops for
+manual validation.【F:tests/player/player.cpp†L5-L190】
 
-## 3. GPU & Renderer Backends
-- **PLS renderer.** `renderer/` implements GPU backends, shader hot-loading, and platform bootstrap helpers. D3D11/12 headers define render targets, descriptor heaps, pipeline managers, and context factories used by Windows apps.【F:renderer/include/rive/renderer/d3d11/render_context_d3d_impl.hpp†L1-L200】【F:renderer/include/rive/renderer/d3d12/render_context_d3d12_impl.hpp†L1-L200】
-- **Premake targets.** `renderer/premake5.lua` creates sample GPU apps (e.g., `path_fiddle`) and links DirectX, GLFW, and optional Dawn/Skia libraries when building on Windows.【F:renderer/premake5.lua†L12-L200】
-- **Testing window abstraction.** `tests/common/testing_window.*` expose a platform-neutral window + renderer factory (`TestingWindow::Init`) that switches between GL, D3D11, D3D12, and other backends based on command-line flags. This is the fastest way to stand up a cross-backend viewer.【F:tests/common/testing_window.hpp†L29-L198】【F:tests/common/testing_window.cpp†L18-L357】
+## Environment initialization
+- Run `build\setup_windows_dev.bat` from `cmd.exe` to append the repository
+build scripts to `PATH`, set `RIVE_ROOT`, and launch the Visual Studio 2022
+Developer Command Prompt automatically when `fxc` is missing.【F:build/setup_windows_dev.bat†L1-L18】
+- The PowerShell variant `build\setup_windows_dev.ps1` performs the same setup,
+including automatically importing the Visual Studio 2022 developer shell before
+restoring the original working directory.【F:build/setup_windows_dev.ps1†L1-L23】
 
-## 4. Sample Applications & Assets
-- **Reference viewer.** `tests/player/player.cpp` demonstrates loading `.riv` bytes, selecting the default artboard/state machine, and rendering frames via `TestingWindow`. Use it as a template for new Windows tools.【F:tests/player/player.cpp†L5-L190】
-- **Additional samples.** `tests/command_buffer_example`, `tests/gm`, and benchmarking folders offer alternative render loops and command-buffer usage patterns; see `tests/premake5.lua` for how they are wired into the build.【F:tests/premake5.lua†L1-L40】【F:tests/premake5.lua†L41-L64】
-- **Assets.** Unit tests ship `.riv` files and fonts under `tests/unit_tests/assets/`; `ReadRiveFile("assets/...")` in tests illustrates relative asset loading when running from the generated build tree.【F:tests/unit_tests/runtime/ik_test.cpp†L9-L45】
+## Building on Windows
+- Use `build\build_rive.bat` (cmd) or `build\build_rive.ps1` (PowerShell) to
+initialize the environment and forward arguments to the shared
+`build_rive.sh` driver running inside Git Bash.【F:build/build_rive.bat†L1-L8】【F:build/build_rive.ps1†L1-L11】
+- `build/build_rive.sh` defaults the generator to Visual Studio 2022 on Windows,
+threads feature flags and platform arguments into Premake, and writes the final
+argument list to `out/<config>/.rive_premake_args` so incremental runs can detect
+mismatched options.【F:build/build_rive.sh†L200-L217】【F:build/build_rive.sh†L283-L293】
+- The script bootstraps Premake (including the Windows Bootstrap batch path) and
+caches helper repositories under `build/dependencies`, ensuring consistent tool
+usage across invocations.【F:build/build_rive.sh†L222-L278】
+- After project generation the script dispatches to `msbuild.exe` for
+Visual Studio solutions, optionally targeting specific projects that you pass on
+the command line (for example, `unit_tests`).【F:build/build_rive.sh†L304-L337】
 
-## 5. Creating a Windows Test App
-1. **Clone an existing tool definition.** Add a new project to `tests/premake5.lua` using `rive_tools_project("my_app", "RiveTool")`. The helper wires in core/runtime libraries, decoders, and renderer dependencies (GLFW, DirectX, etc.) automatically for Windows console apps.【F:tests/premake5.lua†L9-L64】【F:tests/rive_tools_project.lua†L18-L231】
-2. **Choose a backend.** Inside `main`, call `TestingWindow::Init(TestingWindow::Backend::d3d, ...)` or `d3d12` to spin up a DirectX-backed renderer and obtain the `Factory` you need for `rive::File::import`. Command-line parsing can mirror `TestingWindow::ParseBackend` to expose the same options (MSAA, atomic, srgb, GPU filters).【F:tests/common/testing_window.hpp†L133-L198】【F:tests/common/testing_window.cpp†L18-L355】
-3. **Load a `.riv` file.** Use `rive::File::import` with bytes loaded from disk (or embedded arrays) and the `Factory` supplied by the window. The `Player::init` routine is a ready-made pattern: grab the default artboard, fall back to the first animation if no state machine exists, and cache `Renderer` paints/fonts for UI overlays.【F:tests/player/player.cpp†L146-L190】【F:src/file.cpp†L101-L199】
-4. **Render loop.** For quick integration, re-use the `Player::doFrame()` logic: begin each frame via `TestingWindow::beginFrame`, advance the artboard/state machine, draw, and close with `endFrame`. The testing harness already handles keyboard/mouse events and multi-backend toggles through `TestingWindow` input helpers.【F:tests/common/testing_window.hpp†L154-L198】【F:tests/player/player.cpp†L172-L190】
-5. **Asset discovery.** Place sample `.riv` files under your target’s working directory (e.g., copy from `tests/unit_tests/assets`) or embed them as headers like `tests/bench/paper_bboxes_6_copies.hpp` does. Ensure your run configuration points to the correct relative paths when invoking the viewer.【F:tests/unit_tests/runtime/ik_test.cpp†L9-L45】【F:tests/bench/paper_bboxes_6_copies.hpp†L1-L80】
+## Running Windows tests and samples
+- Execute `tests\unit_tests\test.bat` to set up the Visual Studio environment
+(if necessary) and forward arguments to the shared `test.sh` runner.【F:tests/unit_tests/test.bat†L1-L9】
+- On Windows, `tests/unit_tests/test.sh` selects the default clang-cl toolset,
+invokes `build_rive.sh` with runtime tooling/audio/scripting options, and then
+runs the produced `unit_tests` binary from the generated output directory.【F:tests/unit_tests/test.sh†L4-L123】
+- Before launching renderer samples such as `path_fiddle`, build the GLFW
+Release libraries once via `skia/dependencies/make_glfw.sh` so the Windows
+projects can link against the expected static artifacts.【F:skia/dependencies/make_glfw.sh†L12-L25】【F:renderer/premake5.lua†L85-L103】
+- Interactive samples rely on `TestingWindow`, so they inherit the same backend
+selection and render-loop helpers described above when validating Direct3D
+behavior manually.【F:tests/common/testing_window.hpp†L37-L199】【F:tests/player/player.cpp†L143-L190】
 
-## 6. Debugging & Validation
-- **Unit tests.** `tests/unit_tests/test.sh` supports Windows by selecting `vs2022` and allows overriding the MSVC toolset; run it through `build_rive.sh` or the generated solution to validate runtime changes.【F:tests/unit_tests/test.sh†L27-L90】
-- **Command-line assets.** The goldens and GM tools accept `--backend=<name>`; the parsing logic in `TestingWindow::ParseBackend` ensures your new backend strings remain consistent across executables.【F:tests/common/testing_window.cpp†L66-L210】
-- **Renderer inspection.** Windows builds link DirectX debug layers and SwiftShader/Angle toggles via environment variables configured in the testing window; use those toggles to reproduce GPU issues on machines without hardware acceleration.【F:tests/common/testing_window.cpp†L260-L347】
-- **Artifacts & IDE integration.** Premake outputs the Visual Studio solution and DirectX sample binaries under `renderer/out/<config>/`. The generated solution can be opened for debugging, but command-line builds (`build_rive.bat rebuild out/release`) avoid post-build copy steps that rely on GNU tools unavailable inside the IDE.【f78651†L78-L103】
-- **Shader compilation pitfalls.** If `fxc` invocations fail because of spaced paths, mirror the upstream fix by quoting inputs/outputs inside `renderer/src/shaders/Makefile` (e.g., `fxc ... -Fh "$@" "$<"`).【e10483†L1-L24】【b95689†L1-L6】 Ensure the correct MSYS `make` is first on `PATH`—if `setup_windows_dev.bat` resolves to the wrong location, prepend `C:\msys64\usr\bin` manually after running the script.【e10483†L26-L28】
-
-## 7. Additional Resources
-- **Device-independent utilities.** `cg_renderer/` provides a Core Graphics renderer for CPU fallbacks, while `skia/renderer` can be enabled via `--with-skia` for Skia-backed rendering in your tools.【F:cg_renderer/premake5.lua†L1-L46】【F:renderer/premake5.lua†L73-L123】
-- **Development scripts.** `dev/` hosts code generation utilities for the runtime (core definitions, layout metadata). Run these scripts (e.g., `generate_core.sh`) from a POSIX shell when updating generated headers.【F:dev/generate_core.sh†L1-L8】
-- **Dependency caches.** `dependencies/` downloads third-party libraries (HarfBuzz, SheenBidi, miniaudio, Yoga, etc.) during the build; they are automatically included by the premake scripts, so you usually only need to ensure the cache directory is writable.【F:premake5_v2.lua†L33-L63】【F:dependencies/premake5_harfbuzz_v2.lua†L1-L23】
-
-With these pointers you can quickly orient yourself, generate a Windows solution, and adapt the existing player sample into a custom test harness that loads and renders `.riv` files.
+## Troubleshooting tips
+- If you see a Premake argument mismatch error, run the build again with the
+`clean` argument (for example, `build_rive.bat clean debug`) to remove the stale
+output directory before regenerating solutions.【F:build/build_rive.sh†L217-L289】
+- Missing Direct3D dependencies typically indicate the Visual Studio developer
+shell was not loaded; re-run the appropriate `setup_windows_dev` script so
+`fxc`, `msbuild.exe`, and associated SDK headers are on `PATH`.【F:build/setup_windows_dev.bat†L1-L18】【F:build/setup_windows_dev.ps1†L1-L23】
