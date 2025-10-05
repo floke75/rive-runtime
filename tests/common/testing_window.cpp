@@ -129,6 +129,11 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
     {
         return Backend::vk;
     }
+    if (nameStr == "vulkanatomic" || nameStr == "vkatomic")
+    {
+        params->atomic = true;
+        return Backend::vk;
+    }
     if (nameStr == "vulkanmsaa" || nameStr == "vkmsaa")
     {
         params->msaa = true;
@@ -314,7 +319,8 @@ TestingWindow* TestingWindow::Init(Backend backend,
 #if defined(__APPLE__)
             if (visibility == Visibility::headless)
             {
-                s_TestingWindow = TestingWindow::MakeMetalTexture();
+                s_TestingWindow =
+                    TestingWindow::MakeMetalTexture(backendParams);
                 break;
             }
 #endif

@@ -1399,9 +1399,10 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                                   ? desc.combinedShaderFeatures
                                   : batch.shaderFeatures;
         auto shaderMiscFlags = batch.shaderMiscFlags;
-        if (drawType == gpu::DrawType::atomicResolve &&
+        if (drawType == gpu::DrawType::renderPassResolve &&
             renderPassHasCoalescedResolveAndTransfer)
         {
+            assert(desc.interlockMode == gpu::InterlockMode::atomics);
             shaderMiscFlags |=
                 gpu::ShaderMiscFlags::coalescedResolveAndTransfer;
         }
@@ -1427,15 +1428,6 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             },
             m_platformFeatures);
 
-        if (pipeline == nullptr)
-        {
-            // There was an issue getting either the requested pipeline state or
-            // its ubershader counterpart so we cannot draw anything.
-            continue;
-        }
-
-        cmdList->SetPipelineState(pipeline->m_d3dPipelineState.Get());
-
         // all atomic barriers are the same for dx12
         if (batch.barriers &
             (BarrierFlags::plsAtomicPreResolve | BarrierFlags::plsAtomic))
@@ -1459,6 +1451,15 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                     : 2,
                 barriers);
         }
+
+        if (pipeline == nullptr)
+        {
+            // There was an issue getting either the requested pipeline state or
+            // its ubershader counterpart so we cannot draw anything.
+            continue;
+        }
+
+        cmdList->SetPipelineState(pipeline->m_d3dPipelineState.Get());
 
         if (auto imageTextureD3D12 =
                 static_cast<const TextureD3D12Impl*>(batch.imageTexture))
@@ -1618,13 +1619,12 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                                               0);
                 break;
             }
-            case DrawType::atomicResolve:
+            case DrawType::renderPassResolve:
                 assert(desc.interlockMode == gpu::InterlockMode::atomics);
                 cmdList->IASetPrimitiveTopology(
                     D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
                 cmdList->DrawInstanced(4, 1, 0, 0);
                 break;
-            case DrawType::atomicInitialize:
             case DrawType::msaaStrokes:
             case DrawType::msaaMidpointFanBorrowedCoverage:
             case DrawType::msaaMidpointFans:
@@ -1633,6 +1633,7 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             case DrawType::msaaMidpointFanPathsCover:
             case DrawType::msaaOuterCubics:
             case DrawType::msaaStencilClipReset:
+            case DrawType::renderPassInitialize:
                 RIVE_UNREACHABLE();
         }
     }

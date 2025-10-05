@@ -3,11 +3,13 @@
 #include "rive/math/simd.hpp"
 #include "rive/artboard.hpp"
 #include "rive/file.hpp"
+#include "rive/refcnt.hpp"
 #include "rive/layout.hpp"
 #include "rive/animation/state_machine_instance.hpp"
 #include "rive/static_scene.hpp"
 #include "rive/profiler/profiler_macros.h"
 
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <vector>
@@ -847,7 +849,23 @@ void riveMainLoop()
         hotloadShaders = false;
 
 #ifndef RIVE_BUILD_FOR_IOS
-        std::system("sh rebuild_shaders.sh /tmp/rive");
+        // We want to build to /tmp/rive (or the correct equivalent)
+        std::filesystem::path tempRiveDir =
+            std::filesystem::temp_directory_path() / "rive";
+
+        // Get the u8 version of the path (this is especially necessary on
+        // windows where the native path character type is wchar_t, then
+        // reinterpret_cast the char8_t pointer to char so we can append it to
+        // our string.
+        // Store the u8string result to extend its lifetime (need to
+        // reinterpret_cast through a const char * pointer because u8string
+        // returns a std::u8string in C++20 and newer, but we need it as a
+        // "char" string)
+        std::string tempRiveDirStr =
+            reinterpret_cast<const char*>(tempRiveDir.u8string().c_str());
+
+        std::string rebuildCommand = "sh rebuild_shaders.sh " + tempRiveDirStr;
+        std::system(rebuildCommand.c_str());
 #endif
         fiddleContext->hotloadShaders();
     }

@@ -22,9 +22,21 @@ TestingWindow* TestingWindow::MakeAndroidVulkan(const BackendParams&,
 #include <vulkan/vulkan_android.h>
 #include <vk_mem_alloc.h>
 #include <android/native_app_glue/android_native_app_glue.h>
+#include <android/log.h>
 
 using namespace rive;
 using namespace rive::gpu;
+
+// Send errors to stderr and the Android log, just for redundancy in case one or
+// the other gets dropped.
+#define LOG_ERROR_LINE(FORMAT, ...)                                            \
+    [](auto&&... args) {                                                       \
+        fprintf(stderr, FORMAT "\n", std::forward<decltype(args)>(args)...);   \
+        __android_log_print(ANDROID_LOG_ERROR,                                 \
+                            "rive_android_tests",                              \
+                            FORMAT,                                            \
+                            std::forward<decltype(args)>(args)...);            \
+    }(__VA_ARGS__)
 
 class TestingWindowAndroidVulkan : public TestingWindow
 {
@@ -37,22 +49,77 @@ public:
         m_androidWindowHeight = m_height = ANativeWindow_getHeight(window);
         rive_vkb::load_vulkan();
 
-        vkb::InstanceBuilder instanceBuilder;
-        instanceBuilder.set_app_name("path_fiddle")
-            .set_engine_name("Rive Renderer")
-            .enable_extension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)
-            .require_api_version(1, m_backendParams.core ? 0 : 3, 0)
-            .set_minimum_instance_version(1, 0, 0);
-#ifdef DEBUG
-        instanceBuilder.enable_validation_layers(
-            !backendParams.disableValidationLayers);
-        if (!backendParams.disableDebugCallbacks)
+        // Request Vulkan 1.3, except if we're in core mode where we want 1.0.
+        int minorVersionRequested = m_backendParams.core ? 0 : 3;
+
+        for (;;)
         {
-            instanceBuilder.set_debug_callback(
-                rive_vkb::default_debug_callback);
-        }
+            vkb::InstanceBuilder instanceBuilder;
+            instanceBuilder.set_app_name("path_fiddle")
+                .set_engine_name("Rive Renderer")
+                .enable_extension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)
+                .require_api_version(1, minorVersionRequested, 0)
+                .set_minimum_instance_version(1, 0, 0);
+#ifdef DEBUG
+            if (!m_backendParams.disableValidationLayers)
+            {
+                instanceBuilder.enable_validation_layers();
+            }
+            if (!m_backendParams.disableDebugCallbacks)
+            {
+                instanceBuilder.set_debug_callback(
+                    rive_vkb::default_debug_callback);
+            }
 #endif
-        m_instance = VKB_CHECK(instanceBuilder.build());
+            auto instanceResult = instanceBuilder.build();
+            if (!instanceResult)
+            {
+                auto error = static_cast<vkb::InstanceError>(
+                    instanceResult.error().value());
+                if (error ==
+                        vkb::InstanceError::vulkan_version_1_1_unavailable &&
+                    minorVersionRequested != 0)
+                {
+                    // There's a bug in VkBootstrap (due to not properly
+                    // handling Vulkan 1.0 not having the
+                    // vkEnumerateInstanceVersion function) where it can give a
+                    // vulkan_version_1_1_unavailable error even though we've
+                    // specified a minimum of 1.0. If we get that error,
+                    // request 1.0 directly and try again.
+                    LOG_ERROR_LINE("Falling back on Vulkan 1.0.");
+                    minorVersionRequested = 0;
+                    continue;
+                }
+
+#ifdef DEBUG
+                if (!m_backendParams.disableValidationLayers &&
+                    error == vkb::InstanceError::requested_layers_not_present)
+                {
+                    LOG_ERROR_LINE(
+                        "WARNING: Validation layers not found. Attempting to "
+                        "create a Vulkan context again without validation "
+                        "layers.");
+                    m_backendParams.disableValidationLayers = true;
+                    continue;
+                }
+                if (!m_backendParams.disableDebugCallbacks &&
+                    error == vkb::InstanceError::failed_create_debug_messenger)
+                {
+                    LOG_ERROR_LINE(
+                        "WARNING: Debug callbacks not supported. Attempting to "
+                        "create a Vulkan context again without debug "
+                        "callbacks.");
+                    m_backendParams.disableDebugCallbacks = true;
+                    continue;
+                }
+#endif
+                LOG_ERROR_LINE("ERROR: %s: Failed to build Vulkan instance.",
+                               instanceResult.error().message().c_str());
+                abort();
+            }
+            m_instance = *instanceResult;
+            break;
+        }
         m_instanceDispatchTable = m_instance.make_table();
 
         VkAndroidSurfaceCreateInfoKHR androidSurfaceCreateInfo = {
@@ -81,7 +148,8 @@ public:
             m_device.physical_device,
             m_device,
             vulkanFeatures,
-            m_instance.fp_vkGetInstanceProcAddr);
+            m_instance.fp_vkGetInstanceProcAddr,
+            {.forceAtomicMode = backendParams.atomic});
 
         VkSurfaceCapabilitiesKHR windowCapabilities;
         VK_CHECK(m_instanceDispatchTable
@@ -282,7 +350,9 @@ public:
                         .accessMask = VK_ACCESS_TRANSFER_READ_BIT,
                         .layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     }),
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 m_swapchainImage->image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 IAABB{0,
                       0,
                       std::min<int>(m_width, m_androidWindowWidth),
@@ -306,7 +376,7 @@ private:
 
     VulkanContext* vk() const { return impl()->vulkanContext(); }
 
-    const BackendParams m_backendParams;
+    BackendParams m_backendParams;
     uint32_t m_androidWindowWidth;
     uint32_t m_androidWindowHeight;
     vkb::Instance m_instance;

@@ -54,8 +54,6 @@ DrawShaderVulkan::DrawShaderVulkan(Type type,
                     break;
 
                 case DrawType::imageRect:
-                case DrawType::atomicResolve:
-                case DrawType::atomicInitialize:
                 case DrawType::msaaStrokes:
                 case DrawType::msaaMidpointFanBorrowedCoverage:
                 case DrawType::msaaMidpointFans:
@@ -64,6 +62,8 @@ DrawShaderVulkan::DrawShaderVulkan(Type type,
                 case DrawType::msaaMidpointFanPathsCover:
                 case DrawType::msaaOuterCubics:
                 case DrawType::msaaStencilClipReset:
+                case DrawType::renderPassResolve:
+                case DrawType::renderPassInitialize:
                     RIVE_UNREACHABLE();
             }
             break;
@@ -115,7 +115,7 @@ DrawShaderVulkan::DrawShaderVulkan(Type type,
                             : spirv::atomic_draw_image_mesh_frag;
                     break;
 
-                case DrawType::atomicResolve:
+                case DrawType::renderPassResolve:
                     if (shaderMiscFlags &
                         gpu::ShaderMiscFlags::coalescedResolveAndTransfer)
                     {
@@ -131,7 +131,6 @@ DrawShaderVulkan::DrawShaderVulkan(Type type,
                     }
                     break;
 
-                case DrawType::atomicInitialize:
                 case DrawType::msaaStrokes:
                 case DrawType::msaaMidpointFanBorrowedCoverage:
                 case DrawType::msaaMidpointFans:
@@ -140,6 +139,7 @@ DrawShaderVulkan::DrawShaderVulkan(Type type,
                 case DrawType::msaaMidpointFanPathsCover:
                 case DrawType::msaaOuterCubics:
                 case DrawType::msaaStencilClipReset:
+                case DrawType::renderPassInitialize:
                     RIVE_UNREACHABLE();
             }
             break;
@@ -152,28 +152,28 @@ DrawShaderVulkan::DrawShaderVulkan(Type type,
                 case DrawType::midpointFanPatches:
                 case DrawType::midpointFanCenterAAPatches:
                 case DrawType::outerCurvePatches:
-                    vertCode = spirv::draw_clockwise_path_vert;
-                    fragCode = spirv::draw_clockwise_path_frag;
+                    vertCode = spirv::draw_clockwise_atomic_path_vert;
+                    fragCode = spirv::draw_clockwise_atomic_path_frag;
                     break;
 
                 case DrawType::interiorTriangulation:
-                    vertCode = spirv::draw_clockwise_interior_triangles_vert;
-                    fragCode = spirv::draw_clockwise_interior_triangles_frag;
+                    vertCode =
+                        spirv::draw_clockwise_atomic_interior_triangles_vert;
+                    fragCode =
+                        spirv::draw_clockwise_atomic_interior_triangles_frag;
                     break;
 
                 case DrawType::atlasBlit:
-                    vertCode = spirv::draw_clockwise_atlas_blit_vert;
-                    fragCode = spirv::draw_clockwise_atlas_blit_frag;
+                    vertCode = spirv::draw_clockwise_atomic_atlas_blit_vert;
+                    fragCode = spirv::draw_clockwise_atomic_atlas_blit_frag;
                     break;
 
                 case DrawType::imageMesh:
-                    vertCode = spirv::draw_clockwise_image_mesh_vert;
-                    fragCode = spirv::draw_clockwise_image_mesh_frag;
+                    vertCode = spirv::draw_clockwise_atomic_image_mesh_vert;
+                    fragCode = spirv::draw_clockwise_atomic_image_mesh_frag;
                     break;
 
                 case DrawType::imageRect:
-                case DrawType::atomicResolve:
-                case DrawType::atomicInitialize:
                 case DrawType::msaaStrokes:
                 case DrawType::msaaMidpointFanBorrowedCoverage:
                 case DrawType::msaaMidpointFans:
@@ -182,6 +182,8 @@ DrawShaderVulkan::DrawShaderVulkan(Type type,
                 case DrawType::msaaMidpointFanPathsCover:
                 case DrawType::msaaOuterCubics:
                 case DrawType::msaaStencilClipReset:
+                case DrawType::renderPassResolve:
+                case DrawType::renderPassInitialize:
                     RIVE_UNREACHABLE();
             }
             break;
@@ -203,7 +205,10 @@ DrawShaderVulkan::DrawShaderVulkan(Type type,
                 case DrawType::msaaMidpointFanStencilReset:
                 case DrawType::msaaMidpointFanPathsStencil:
                 case DrawType::msaaMidpointFanPathsCover:
-                    vertCode = spirv::draw_msaa_path_vert;
+                    vertCode =
+                        (shaderFeatures & ShaderFeatures::ENABLE_CLIP_RECT)
+                            ? spirv::draw_msaa_path_vert
+                            : spirv::draw_msaa_path_noclipdistance_vert;
                     fragCode = fixedFunctionColorOutput
                                    ? spirv::draw_msaa_path_fixedcolor_frag
                                    : spirv::draw_msaa_path_frag;
@@ -220,22 +225,35 @@ DrawShaderVulkan::DrawShaderVulkan(Type type,
                     break;
 
                 case DrawType::atlasBlit:
-                    vertCode = spirv::draw_msaa_atlas_blit_vert;
+                    vertCode =
+                        (shaderFeatures & ShaderFeatures::ENABLE_CLIP_RECT)
+                            ? spirv::draw_msaa_atlas_blit_vert
+                            : spirv::draw_msaa_atlas_blit_noclipdistance_vert;
                     fragCode = fixedFunctionColorOutput
                                    ? spirv::draw_msaa_atlas_blit_fixedcolor_frag
                                    : spirv::draw_msaa_atlas_blit_frag;
                     break;
 
                 case DrawType::imageMesh:
-                    vertCode = spirv::draw_msaa_image_mesh_vert;
+                    vertCode =
+                        (shaderFeatures & ShaderFeatures::ENABLE_CLIP_RECT)
+                            ? spirv::draw_msaa_image_mesh_vert
+                            : spirv::draw_msaa_image_mesh_noclipdistance_vert;
                     fragCode = fixedFunctionColorOutput
                                    ? spirv::draw_msaa_image_mesh_fixedcolor_frag
                                    : spirv::draw_msaa_image_mesh_frag;
                     break;
 
+                case DrawType::renderPassInitialize:
+                    // MSAA render passes get initialized by drawing the
+                    // previous contents into the framebuffer.
+                    // (LoadAction::preserveRenderTarget only.)
+                    vertCode = spirv::copy_attachment_to_attachment_vert;
+                    fragCode = spirv::copy_attachment_to_attachment_frag;
+                    break;
+
                 case DrawType::imageRect:
-                case DrawType::atomicResolve:
-                case DrawType::atomicInitialize:
+                case DrawType::renderPassResolve:
                     RIVE_UNREACHABLE();
             }
             break;

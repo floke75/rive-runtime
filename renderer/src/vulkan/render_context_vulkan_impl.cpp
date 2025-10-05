@@ -16,7 +16,6 @@
 #include "draw_shader_vulkan.hpp"
 #include "pipeline_manager_vulkan.hpp"
 #include "render_pass_vulkan.hpp"
-#include "vulkan_constants.hpp"
 
 namespace rive::gpu
 {
@@ -580,7 +579,8 @@ private:
 
 RenderContextVulkanImpl::RenderContextVulkanImpl(
     rcp<VulkanContext> vk,
-    const VkPhysicalDeviceProperties& physicalDeviceProps) :
+    const VkPhysicalDeviceProperties& physicalDeviceProps,
+    const ContextOptions& contextOptions) :
     m_vk(std::move(vk)),
     m_flushUniformBufferPool(m_vk, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT),
     m_imageDrawUniformBufferPool(m_vk, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT),
@@ -595,8 +595,17 @@ RenderContextVulkanImpl::RenderContextVulkanImpl(
 {
     m_platformFeatures.supportsRasterOrdering =
         m_vk->features.rasterizationOrderColorAttachmentAccess;
+#ifdef RIVE_ANDROID
+    m_platformFeatures.supportsFragmentShaderAtomics =
+        m_vk->features.fragmentStoresAndAtomics &&
+        // For now, disable gpu::InterlockMode::atomics on Android unless
+        // explicitly requested. We will focus on stabilizing MSAA first, and
+        // then roll this mode back in.
+        contextOptions.forceAtomicMode;
+#else
     m_platformFeatures.supportsFragmentShaderAtomics =
         m_vk->features.fragmentStoresAndAtomics;
+#endif
     m_platformFeatures.supportsClockwiseAtomicRendering =
         m_vk->features.fragmentStoresAndAtomics;
     m_platformFeatures.supportsClipPlanes =
@@ -607,6 +616,10 @@ RenderContextVulkanImpl::RenderContextVulkanImpl(
         physicalDeviceProps.limits.maxClipDistances >= 4;
     m_platformFeatures.clipSpaceBottomUp = false;
     m_platformFeatures.framebufferBottomUp = false;
+    // Vulkan can't load color from a different texture into the transient MSAA
+    // texture. We need to draw the previous renderTarget contents into it
+    // manually when LoadAction::preserveRenderTarget is specified.
+    m_platformFeatures.msaaColorPreserveNeedsDraw = true;
     m_platformFeatures.maxCoverageBufferLength =
         std::min(physicalDeviceProps.limits.maxStorageBufferRange, 1u << 28) /
         sizeof(uint32_t);
@@ -989,9 +1002,20 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
     constexpr static VkDeviceSize ZERO_OFFSET[1] = {0};
     constexpr static uint32_t ZERO_OFFSET_32[1] = {0};
 
-    if (desc.renderTargetUpdateBounds.empty())
+    auto* renderTarget = static_cast<RenderTargetVulkan*>(desc.renderTarget);
+
+    IAABB drawBounds = desc.renderTargetUpdateBounds;
+    if (drawBounds.empty())
     {
         return;
+    }
+
+    if (desc.interlockMode == gpu::InterlockMode::msaa)
+    {
+        // Vulkan does not support partial MSAA resolves.
+        // TODO: We should consider adding a new subpass that reads the MSAA
+        // buffer and resolves it manually for partial updates.
+        drawBounds = renderTarget->bounds();
     }
 
     auto commandBuffer =
@@ -1452,9 +1476,8 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
             .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         });
 
-    auto* renderTarget = static_cast<RenderTargetVulkan*>(desc.renderTarget);
-
-    vkutil::Texture2D *clipTexture, *scratchColorTexture, *coverageTexture;
+    vkutil::Texture2D *clipTexture = nullptr, *scratchColorTexture = nullptr,
+                      *coverageTexture = nullptr;
     if (desc.interlockMode == gpu::InterlockMode::rasterOrdering)
     {
         clipTexture = renderTarget->clipTextureR32UI();
@@ -1464,7 +1487,6 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
     else if (desc.interlockMode == gpu::InterlockMode::atomics)
     {
         clipTexture = renderTarget->clipTextureRGBA8();
-        scratchColorTexture = nullptr;
         coverageTexture = renderTarget->coverageAtomicTexture();
     }
 
@@ -1488,7 +1510,7 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
                       : VK_IMAGE_LAYOUT_GENERAL,
     };
 
-    const bool renderAreaIsFullTarget = desc.renderTargetUpdateBounds.contains(
+    const bool renderAreaIsFullTarget = drawBounds.contains(
         IAABB{0,
               0,
               static_cast<int32_t>(renderTarget->width()),
@@ -1502,61 +1524,9 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
 
     VkImageView colorImageView = VK_NULL_HANDLE;
     bool colorAttachmentIsOffscreen = false;
-    if (desc.interlockMode == gpu::InterlockMode::msaa)
-    {
-        renderTarget->msaaColorTexture()->barrier(commandBuffer,
-                                                  colorLoadAccess,
-                                                  targetAccessAction);
-        colorImageView = renderTarget->msaaColorTexture()->vkImageView();
-    }
-    else if (fixedFunctionColorOutput || (renderTarget->targetUsageFlags() &
-                                          VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
-    {
-        colorImageView =
-            renderTarget->accessTargetImageView(commandBuffer,
-                                                colorLoadAccess,
-                                                targetAccessAction);
-    }
-    else if (desc.colorLoadAction != gpu::LoadAction::preserveRenderTarget)
-    {
-        colorImageView = renderTarget
-                             ->accessOffscreenColorTexture(
-                                 commandBuffer,
-                                 colorLoadAccess,
-                                 vkutil::ImageAccessAction::invalidateContents)
-                             ->vkImageView();
-        colorAttachmentIsOffscreen = true;
-    }
-    else
-    {
-        // Preserve the target texture by blitting its contents into our
-        // offscreen color texture.
-        m_vk->blitSubRect(
-            commandBuffer,
-            renderTarget->accessTargetImage(
-                commandBuffer,
-                {
-                    .pipelineStages = VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    .accessMask = VK_ACCESS_TRANSFER_READ_BIT,
-                    .layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                }),
-            renderTarget
-                ->accessOffscreenColorTexture(
-                    commandBuffer,
-                    {
-                        .pipelineStages = VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        .accessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                        .layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    },
-                    vkutil::ImageAccessAction::invalidateContents)
-                ->vkImage(),
-            desc.renderTargetUpdateBounds);
-        colorImageView =
-            renderTarget
-                ->accessOffscreenColorTexture(commandBuffer, colorLoadAccess)
-                ->vkImageView();
-        colorAttachmentIsOffscreen = true;
-    }
+
+    VkImageView msaaResolveImageView = VK_NULL_HANDLE;
+    VkImageView msaaColorSeedImageView = VK_NULL_HANDLE;
 
     auto pipelineLayoutOptions = DrawPipelineLayoutVulkan::Options::none;
     if (fixedFunctionColorOutput)
@@ -1564,11 +1534,109 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
         pipelineLayoutOptions |=
             DrawPipelineLayoutVulkan::Options::fixedFunctionColorOutput;
     }
-    else if (desc.interlockMode == gpu::InterlockMode::atomics &&
-             colorAttachmentIsOffscreen)
+
+    if (desc.interlockMode == gpu::InterlockMode::msaa)
     {
-        pipelineLayoutOptions |=
-            DrawPipelineLayoutVulkan::Options::coalescedResolveAndTransfer;
+        // MSAA mode always renders to a transient MSAA color buffer. (The
+        // render target is single-sampled.)
+        renderTarget->msaaColorTexture()->barrier(
+            commandBuffer,
+            colorLoadAccess,
+            vkutil::ImageAccessAction::invalidateContents);
+        colorImageView = renderTarget->msaaColorTexture()->vkImageView();
+
+        if (desc.colorLoadAction == gpu::LoadAction::preserveRenderTarget &&
+            renderTarget->targetUsageFlags() &
+                VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)
+        {
+            // We can seed from, and resolve to the the same texture.
+            msaaColorSeedImageView = msaaResolveImageView =
+                renderTarget->accessTargetImageView(
+                    commandBuffer,
+                    {
+                        // Apply a barrier for reading from this texture as an
+                        // input attachment.
+                        // vkCmdNextSubpass() will handle the barrier between
+                        // reading this texture and resolving to it.
+                        .pipelineStages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        .accessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+                        .layout = VK_IMAGE_LAYOUT_GENERAL,
+                    });
+        }
+        else
+        {
+            if (desc.colorLoadAction == gpu::LoadAction::preserveRenderTarget)
+            {
+                // We have to seed the MSAA attachment from a separate texture
+                // because the render target doesn't support being bound as an
+                // input attachment.
+                msaaColorSeedImageView =
+                    renderTarget
+                        ->copyTargetImageToOffscreenColorTexture(
+                            commandBuffer,
+                            {
+                                .pipelineStages =
+                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                .accessMask =
+                                    VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+                                .layout = VK_IMAGE_LAYOUT_GENERAL,
+                            },
+                            drawBounds)
+                        ->vkImageView();
+                pipelineLayoutOptions |= DrawPipelineLayoutVulkan::Options::
+                    msaaSeedFromOffscreenTexture;
+            }
+            msaaResolveImageView = renderTarget->accessTargetImageView(
+                commandBuffer,
+                {
+                    .pipelineStages =
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    .accessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                },
+                renderAreaIsFullTarget
+                    ? vkutil::ImageAccessAction::invalidateContents
+                    : vkutil::ImageAccessAction::preserveContents);
+        }
+    }
+    else if (fixedFunctionColorOutput || (renderTarget->targetUsageFlags() &
+                                          VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
+    {
+        // We can render directly to the render target.
+        colorImageView =
+            renderTarget->accessTargetImageView(commandBuffer,
+                                                colorLoadAccess,
+                                                targetAccessAction);
+    }
+    else
+    {
+        if (desc.colorLoadAction == gpu::LoadAction::preserveRenderTarget)
+        {
+            // Preserve the target texture by copying its contents into our
+            // offscreen color texture.
+            colorImageView =
+                renderTarget
+                    ->copyTargetImageToOffscreenColorTexture(commandBuffer,
+                                                             colorLoadAccess,
+                                                             drawBounds)
+                    ->vkImageView();
+        }
+        else
+        {
+            colorImageView =
+                renderTarget
+                    ->accessOffscreenColorTexture(
+                        commandBuffer,
+                        colorLoadAccess,
+                        vkutil::ImageAccessAction::invalidateContents)
+                    ->vkImageView();
+        }
+        if (desc.interlockMode == gpu::InterlockMode::atomics)
+        {
+            pipelineLayoutOptions |=
+                DrawPipelineLayoutVulkan::Options::coalescedResolveAndTransfer;
+        }
+        colorAttachmentIsOffscreen = true;
     }
 
     RenderPassVulkan& renderPass = m_pipelineManager->getRenderPassSynchronous(
@@ -1580,8 +1648,8 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
         *renderPass.drawPipelineLayout();
 
     // Create the framebuffer.
-    StackVector<VkImageView, MAX_FRAMEBUFFER_ATTACHMENTS> framebufferViews;
-    StackVector<VkClearValue, MAX_FRAMEBUFFER_ATTACHMENTS> clearValues;
+    StackVector<VkImageView, PLS_PLANE_COUNT> framebufferViews;
+    StackVector<VkClearValue, PLS_PLANE_COUNT> clearValues;
     assert(framebufferViews.size() == COLOR_PLANE_IDX);
     framebufferViews.push_back(colorImageView);
     clearValues.push_back(
@@ -1634,15 +1702,20 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
             {.depthStencil = {desc.depthClearValue, desc.stencilClearValue}});
 
         assert(framebufferViews.size() == MSAA_RESOLVE_IDX);
-        framebufferViews.push_back(renderTarget->accessTargetImageView(
-            commandBuffer,
-            {
-                .pipelineStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .accessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            },
-            targetAccessAction));
+        framebufferViews.push_back(msaaResolveImageView);
         clearValues.push_back({});
+
+        if (pipelineLayout.options() &
+            DrawPipelineLayoutVulkan::Options::msaaSeedFromOffscreenTexture)
+        {
+            assert(desc.colorLoadAction ==
+                   gpu::LoadAction::preserveRenderTarget);
+            assert(msaaColorSeedImageView != VK_NULL_HANDLE);
+            assert(msaaColorSeedImageView != msaaResolveImageView);
+            assert(framebufferViews.size() == MSAA_COLOR_SEED_IDX);
+            framebufferViews.push_back(msaaColorSeedImageView);
+            clearValues.push_back({});
+        }
     }
 
     rcp<vkutil::Framebuffer> framebuffer = m_vk->makeFramebuffer({
@@ -1655,11 +1728,9 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
     });
 
     VkRect2D renderArea = {
-        .offset = {desc.renderTargetUpdateBounds.left,
-                   desc.renderTargetUpdateBounds.top},
-        .extent = {static_cast<uint32_t>(desc.renderTargetUpdateBounds.width()),
-                   static_cast<uint32_t>(
-                       desc.renderTargetUpdateBounds.height())},
+        .offset = {drawBounds.left, drawBounds.top},
+        .extent = {static_cast<uint32_t>(drawBounds.width()),
+                   static_cast<uint32_t>(drawBounds.height())},
     };
 
     if (desc.interlockMode == gpu::InterlockMode::atomics)
@@ -1820,8 +1891,10 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
                 }});
         }
 
-        if (desc.interlockMode != gpu::InterlockMode::msaa)
+        if (clipTexture != nullptr)
         {
+            assert(desc.interlockMode == gpu::InterlockMode::rasterOrdering ||
+                   desc.interlockMode == gpu::InterlockMode::atomics);
             m_vk->updateImageDescriptorSets(
                 inputAttachmentDescriptorSet,
                 {
@@ -1832,22 +1905,27 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
                     .imageView = clipTexture->vkImageView(),
                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                 }});
+        }
 
-            if (desc.interlockMode == gpu::InterlockMode::rasterOrdering)
-            {
-                m_vk->updateImageDescriptorSets(
-                    inputAttachmentDescriptorSet,
-                    {
-                        .dstBinding = SCRATCH_COLOR_PLANE_IDX,
-                        .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
-                    },
-                    {{
-                        .imageView = scratchColorTexture->vkImageView(),
-                        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-                    }});
-            }
+        if (scratchColorTexture != nullptr)
+        {
+            assert(desc.interlockMode == gpu::InterlockMode::rasterOrdering);
+            m_vk->updateImageDescriptorSets(
+                inputAttachmentDescriptorSet,
+                {
+                    .dstBinding = SCRATCH_COLOR_PLANE_IDX,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+                },
+                {{
+                    .imageView = scratchColorTexture->vkImageView(),
+                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                }});
+        }
 
-            assert(coverageTexture != nullptr);
+        if (coverageTexture != nullptr)
+        {
+            assert(desc.interlockMode == gpu::InterlockMode::rasterOrdering ||
+                   desc.interlockMode == gpu::InterlockMode::atomics);
             m_vk->updateImageDescriptorSets(
                 inputAttachmentDescriptorSet,
                 {
@@ -1859,6 +1937,23 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
                 },
                 {{
                     .imageView = coverageTexture->vkImageView(),
+                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                }});
+        }
+
+        if (msaaColorSeedImageView != VK_NULL_HANDLE)
+        {
+            assert(desc.interlockMode == gpu::InterlockMode::msaa &&
+                   desc.colorLoadAction ==
+                       gpu::LoadAction::preserveRenderTarget);
+            m_vk->updateImageDescriptorSets(
+                inputAttachmentDescriptorSet,
+                {
+                    .dstBinding = MSAA_COLOR_SEED_IDX,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+                },
+                {{
+                    .imageView = msaaColorSeedImageView,
                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                 }});
         }
@@ -1987,8 +2082,9 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
         }
         if ((pipelineLayout.options() &
              DrawPipelineLayoutVulkan::Options::coalescedResolveAndTransfer) &&
-            (drawType == gpu::DrawType::atomicResolve))
+            (drawType == gpu::DrawType::renderPassResolve))
         {
+            assert(desc.interlockMode == gpu::InterlockMode::atomics);
             shaderMiscFlags |=
                 gpu::ShaderMiscFlags::coalescedResolveAndTransfer;
         }
@@ -2024,33 +2120,31 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
                 },
                 m_platformFeatures);
 
-        if (drawPipeline == nullptr)
+        if (batch.barriers & (gpu::BarrierFlags::plsAtomicPreResolve |
+                              gpu::BarrierFlags::msaaPostInit))
         {
-            continue;
-        }
-
-        m_vk->CmdBindPipeline(commandBuffer,
-                              VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              *drawPipeline);
-
-        if (batch.barriers & BarrierFlags::plsAtomicPreResolve)
-        {
-            // The atomic resolve gets its barrier via vkCmdNextSubpass().
-            assert(desc.interlockMode == gpu::InterlockMode::atomics);
-            assert(drawType == gpu::DrawType::atomicResolve);
+            // vkCmdNextSubpass() supersedes the pipeline barrier we would
+            // insert for plsAtomic | dstBlend. So if those flags are also in
+            // the barrier, we can just call vkCmdNextSubpass() and skip
+            // vkCmdPipelineBarrier().
+            assert(
+                !(batch.barriers &
+                  ~(gpu::BarrierFlags::plsAtomicPreResolve |
+                    gpu::BarrierFlags::msaaPostInit | BarrierFlags::plsAtomic |
+                    BarrierFlags::dstBlend | BarrierFlags::drawBatchBreak)));
             m_vk->CmdNextSubpass(commandBuffer, VK_SUBPASS_CONTENTS_INLINE);
         }
         else if (batch.barriers &
-                 (BarrierFlags::plsAtomicPostInit | BarrierFlags::plsAtomic |
-                  BarrierFlags::dstBlend))
+                 (BarrierFlags::plsAtomic | BarrierFlags::dstBlend))
         {
             // Wait for color attachment writes to complete before we read the
-            // input attachments again. (We also checked for "plsAtomicPostInit"
-            // because this barrier has to occur after the Vulkan load
-            // operations as well.)
+            // input attachments again.
             assert(desc.interlockMode == gpu::InterlockMode::atomics ||
                    desc.interlockMode == gpu::InterlockMode::msaa);
-            assert(drawType != gpu::DrawType::atomicResolve);
+            assert(drawType != gpu::DrawType::renderPassResolve);
+            assert(!(batch.barriers &
+                     ~(BarrierFlags::plsAtomic | BarrierFlags::dstBlend |
+                       BarrierFlags::drawBatchBreak)));
             m_vk->memoryBarrier(
                 commandBuffer,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -2070,6 +2164,9 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
             // Wait for prior fragment shaders to finish updating the coverage
             // buffer before we read it again.
             assert(desc.interlockMode == gpu::InterlockMode::clockwiseAtomic);
+            assert(
+                !(batch.barriers & ~(BarrierFlags::clockwiseBorrowedCoverage |
+                                     BarrierFlags::drawBatchBreak)));
             m_vk->memoryBarrier(commandBuffer,
                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -2079,6 +2176,15 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
                                     .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
                                 });
         }
+
+        if (drawPipeline == nullptr)
+        {
+            continue;
+        }
+
+        m_vk->CmdBindPipeline(commandBuffer,
+                              VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              *drawPipeline);
 
         switch (drawType)
         {
@@ -2189,15 +2295,12 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
                 break;
             }
 
-            case DrawType::atomicResolve:
+            case DrawType::renderPassInitialize:
+            case DrawType::renderPassResolve:
             {
-                assert(desc.interlockMode == gpu::InterlockMode::atomics);
                 m_vk->CmdDraw(commandBuffer, 4, 1, 0, 0);
                 break;
             }
-
-            case DrawType::atomicInitialize:
-                RIVE_UNREACHABLE();
         }
     }
 
@@ -2219,6 +2322,7 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
                         .layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     })
                 ->vkImage(),
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             renderTarget->accessTargetImage(
                 commandBuffer,
                 {
@@ -2227,7 +2331,8 @@ void RenderContextVulkanImpl::flush(const FlushDescriptor& desc)
                     .layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 },
                 vkutil::ImageAccessAction::invalidateContents),
-            desc.renderTargetUpdateBounds);
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            drawBounds);
     }
 
     m_descriptorSetPoolPool->recycle(std::move(descriptorSetPool));
@@ -2267,7 +2372,7 @@ std::unique_ptr<RenderContext> RenderContextVulkanImpl::MakeContext(
     VkDevice device,
     const VulkanFeatures& features,
     PFN_vkGetInstanceProcAddr pfnvkGetInstanceProcAddr,
-    ShaderCompilationMode shaderCompilationMode)
+    const ContextOptions& contextOptions)
 {
     rcp<VulkanContext> vk = make_rcp<VulkanContext>(instance,
                                                     physicalDevice,
@@ -2277,13 +2382,19 @@ std::unique_ptr<RenderContext> RenderContextVulkanImpl::MakeContext(
     VkPhysicalDeviceProperties physicalDeviceProps;
     vk->GetPhysicalDeviceProperties(vk->physicalDevice, &physicalDeviceProps);
     std::unique_ptr<RenderContextVulkanImpl> impl(
-        new RenderContextVulkanImpl(std::move(vk), physicalDeviceProps));
-    if (!impl->platformFeatures().supportsRasterOrdering &&
+        new RenderContextVulkanImpl(std::move(vk),
+                                    physicalDeviceProps,
+                                    contextOptions));
+    if (contextOptions.forceAtomicMode &&
         !impl->platformFeatures().supportsFragmentShaderAtomics)
     {
-        return nullptr; // TODO: implement MSAA.
+        fprintf(stderr,
+                "ERROR: Requested \"atomic\" mode but Vulkan does not support "
+                "fragmentStoresAndAtomics on this platform.\n");
+        return nullptr;
     }
-    impl->initGPUObjects(shaderCompilationMode, physicalDeviceProps.vendorID);
+    impl->initGPUObjects(contextOptions.shaderCompilationMode,
+                         physicalDeviceProps.vendorID);
     return std::make_unique<RenderContext>(std::move(impl));
 }
 } // namespace rive::gpu

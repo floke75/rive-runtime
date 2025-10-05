@@ -175,9 +175,8 @@ TEST_CASE("artboard management", "[CommandQueue]")
 
     // Deleting the file first should now delete the artboard as well.
     commandQueue->deleteFile(fileHandle);
-    commandQueue->runOnce([fileHandle, artboardHandle1](CommandServer* server) {
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
         CHECK(server->getFile(fileHandle) == nullptr);
-        CHECK(server->getArtboardInstance(artboardHandle1) == nullptr);
     });
 
     commandQueue->deleteArtboard(artboardHandle1);
@@ -792,7 +791,7 @@ TEST_CASE("View Models", "[CommandQueue]")
         auto list =
             server->getViewModelInstance(bviewModel)->propertyList("Test List");
         CHECK(list != nullptr);
-        CHECK(list->instanceAt(0) ==
+        CHECK(list->instanceAt(0).get() ==
               server->getViewModelInstance(listViewModel));
     });
 
@@ -942,12 +941,12 @@ public:
         m_hasCallback = true;
     }
 
-    std::array<std::string, 6> m_expectedViewModelNames = {"Empty VM",
+    std::array<std::string, 6> m_expectedViewModelNames = {"ListViewModel",
+                                                           "Empty VM",
                                                            "Test All",
                                                            "Nested VM",
                                                            "State Transition",
-                                                           "Alternate VM",
-                                                           "Test Slash"};
+                                                           "Alternate VM"};
     bool m_hasCallback = false;
     FileHandle m_fileHandle = RIVE_NULL_HANDLE;
     uint64_t m_requestId;
@@ -1071,7 +1070,8 @@ public:
                                                               "Test Trigger"},
             CommandQueue::FileListener::ViewModelPropertyData{
                 DataType::viewModel,
-                "Test Nested"}};
+                "Test Nested",
+                "Nested VM"}};
 
     bool m_hasInstanceCallback = false;
     bool m_hasPropertyCallback = false;
@@ -1628,7 +1628,7 @@ public:
             CHECK(nested != nullptr);
             auto property = instance->propertyViewModel(name);
             CHECK(property != nullptr);
-            CHECK(property == nested);
+            CHECK(property.get() == nested);
         });
 
         // There is no requesting for nested view models
@@ -1807,20 +1807,24 @@ TEST_CASE("View Model Property Set/Get", "[CommandQueue]")
         });
 
     // Same for artboards.
+    auto bindableArtboardHandle =
+        commandQueue->instantiateDefaultArtboard(fileHandle);
     commandQueue->setViewModelInstanceArtboard(tester.m_handle,
                                                "Test Artboard",
-                                               artboardHandle);
+                                               bindableArtboardHandle);
 
-    commandQueue->runOnce([artboardHandle,
+    commandQueue->runOnce([bindableArtboardHandle,
                            handle = tester.m_handle](CommandServer* server) {
-        auto artboard = server->getArtboardInstance(artboardHandle);
-        CHECK(artboard != nullptr);
+        auto bindableArtboard =
+            server->getBindableArtboard(bindableArtboardHandle);
+        CHECK(bindableArtboard != nullptr);
         auto viewModel = server->getViewModelInstance(handle);
         CHECK(viewModel != nullptr);
         auto artboardProperty = viewModel->propertyArtboard("Test Artboard");
         CHECK(artboardProperty != nullptr);
-        CHECK(artboardProperty->testing_value() == artboard);
+        CHECK(artboardProperty->testing_value() == bindableArtboard);
     });
+    commandQueue->deleteArtboard(bindableArtboardHandle);
 
     auto badImageHandle =
         commandQueue->decodeImage(std::vector<uint8_t>(1024 * 1024, {}));
@@ -2512,8 +2516,8 @@ public:
             CHECK(value2Instance != nullptr);
             auto property = instance->propertyList(name);
             CHECK(property != nullptr);
-            CHECK(property->instanceAt(index) == value1Instance);
-            CHECK(property->instanceAt(index2) == value2Instance);
+            CHECK(property->instanceAt(index).get() == value1Instance);
+            CHECK(property->instanceAt(index2).get() == value2Instance);
         });
     }
 
@@ -2532,23 +2536,23 @@ public:
                 auto property = instance->propertyList(name);
                 CHECK(property != nullptr);
                 auto valueModel = server->getViewModelInstance(value);
-                CHECK(property->instanceAt(index) == valueModel);
+                CHECK(property->instanceAt(index).get() == valueModel);
             });
     }
 
     void pushExpectation(std::string name, ViewModelInstanceHandle value)
     {
         m_queue->appendViewModelInstanceListViewModel(m_handle, name, value);
-        m_queue->runOnce(
-            [handle = m_handle, name, value](CommandServer* server) {
-                auto instance = server->getViewModelInstance(handle);
-                CHECK(instance != nullptr);
-                auto property = instance->propertyList(name);
-                CHECK(property != nullptr);
-                auto valueModel = server->getViewModelInstance(value);
-                CHECK(property->instanceAt(static_cast<int>(property->size()) -
-                                           1) == valueModel);
-            });
+        m_queue->runOnce([handle = m_handle, name, value](
+                             CommandServer* server) {
+            auto instance = server->getViewModelInstance(handle);
+            CHECK(instance != nullptr);
+            auto property = instance->propertyList(name);
+            CHECK(property != nullptr);
+            auto valueModel = server->getViewModelInstance(value);
+            CHECK(property->instanceAt(static_cast<int>(property->size()) - 1)
+                      .get() == valueModel);
+        });
     }
 
     void pushBadExpectation(std::string name,
@@ -2616,12 +2620,12 @@ TEST_CASE("List View Model Property Set/Get", "[CommandQueue]")
                                                         "Alternate Nested");
     tester.pushExpectation("Test List", blankHandle);
     tester.pushExpectation("Test List", alternateHandle);
-    tester.pushExpectation("Test List", alternateHandle, blankHandle, 0, 1);
-    tester.pushRequestExpectation("Test List", 2);
+    tester.pushExpectation("Test List", alternateHandle, blankHandle, 2, 3);
+    tester.pushRequestExpectation("Test List", 4);
     tester.pushExpectation("Test List", blankHandle, 0);
     tester.pushExpectation("Test List", alternateHandle, 0);
     tester.pushExpectation("Test List", blankHandle, alternateHandle, 0, 1);
-    tester.pushRequestExpectation("Test List", 4);
+    tester.pushRequestExpectation("Test List", 6);
 
     auto badBlankHandle =
         commandQueue->instantiateBlankViewModelInstance(fileHandle, "blah");
@@ -2645,7 +2649,7 @@ TEST_CASE("List View Model Property Set/Get", "[CommandQueue]")
     tester.pushBadExpectation("Blah", 10, 1);
     tester.pushBadExpectation("Blah", 0, 10);
 
-    tester.pushRequestExpectation("Test List", 4);
+    tester.pushRequestExpectation("Test List", 6);
 
     tester.pushBadRequestExpectation("Blah");
 
@@ -4113,15 +4117,16 @@ public:
                                    enums);
 
     FileHandle m_handle;
-    std::array<std::string, 3> m_artboardNames = {"Test Artboard",
+    std::array<std::string, 4> m_artboardNames = {"Test Artboard",
                                                   "Test Transitions",
-                                                  "Test Observation"};
-    std::array<std::string, 6> m_viewModelNames = {"Empty VM",
+                                                  "Test Observation",
+                                                  "Artboard"};
+    std::array<std::string, 6> m_viewModelNames = {"ListViewModel",
+                                                   "Empty VM",
                                                    "Test All",
                                                    "Nested VM",
                                                    "State Transition",
-                                                   "Alternate VM",
-                                                   "Test Slash"};
+                                                   "Alternate VM"};
     std::array<std::string, 2> m_instanceNames = {"Test Default",
                                                   "Test Alternate"};
     std::array<CommandQueue::FileListener::ViewModelPropertyData, 10>
@@ -4150,7 +4155,8 @@ public:
                                                               "Test Trigger"},
             CommandQueue::FileListener::ViewModelPropertyData{
                 DataType::viewModel,
-                "Test Nested"}};
+                "Test Nested",
+                "Nested VM"}};
     std::array<ViewModelEnum, 1> m_enums = {
         ViewModelEnum{"Test Enum Values", {"Value 1", "Value 2"}}};
     std::string m_viewModelNameI = "Test All";
@@ -4249,7 +4255,7 @@ public:
                                    size_t,
                                    size);
 
-    size_t m_size = 0;
+    size_t m_size = 2;
     std::string m_path = "Test List";
     ViewModelInstanceHandle m_handle;
     CommandQueue::ViewModelInstanceData m_instanceData = {

@@ -23,6 +23,7 @@
 #include "rive/nested_artboard_leaf.hpp"
 #include "rive/nested_artboard_layout.hpp"
 #include "rive/joystick.hpp"
+#include "rive/data_bind/data_bind.hpp"
 #include "rive/data_bind_flags.hpp"
 #include "rive/animation/nested_bool.hpp"
 #include "rive/animation/nested_number.hpp"
@@ -73,10 +74,7 @@ Artboard::~Artboard()
         delete object;
     }
 
-    for (auto dataBind : m_DataBinds)
-    {
-        delete dataBind;
-    }
+    deleteDataBinds();
 
     // Instances reference back to the original artboard's animations and state
     // machines, so don't delete them here, they'll get cleaned up when the
@@ -639,7 +637,7 @@ void Artboard::cloneObjectDataBinds(const Core* object,
                                     Artboard* artboard) const
 {
 
-    for (auto dataBind : m_DataBinds)
+    for (auto dataBind : dataBinds())
     {
         if (dataBind->target() == object)
         {
@@ -652,7 +650,7 @@ void Artboard::cloneObjectDataBinds(const Core* object,
                 dataBindClone->converter(
                     dataBind->converter()->clone()->as<DataConverter>());
             }
-            artboard->m_DataBinds.push_back(dataBindClone);
+            artboard->addDataBind(dataBindClone);
         }
     }
 }
@@ -779,36 +777,19 @@ void Artboard::update(ComponentDirt value)
     m_hostTransformMarkedDirty = false;
 }
 
-void Artboard::updateDataBinds()
+void Artboard::addDirtyDataBind(DataBind* dataBind)
+{
+    onComponentDirty(dataBind->target()->as<Component>());
+    DataBindContainer::addDirtyDataBind(dataBind);
+}
+
+void Artboard::updateDataBinds(bool applyTargetToSource)
 {
     for (auto artboardHost : m_ArtboardHosts)
     {
         artboardHost->updateDataBinds();
     }
-    for (auto dataBind : m_DataBinds)
-    {
-        if (dataBind->canSkip())
-        {
-            continue;
-        }
-
-        if (!dataBind->sourceToTargetRunsFirst())
-        {
-
-            dataBind->updateSourceBinding();
-        }
-        auto d = dataBind->dirt();
-        if (d != ComponentDirt::None)
-        {
-            dataBind->dirt(ComponentDirt::None);
-            dataBind->update(d);
-        }
-        if (dataBind->sourceToTargetRunsFirst())
-        {
-
-            dataBind->updateSourceBinding();
-        }
-    }
+    DataBindContainer::updateDataBinds(applyTargetToSource);
 }
 
 bool Artboard::updateComponents()
@@ -1068,12 +1049,9 @@ bool Artboard::advanceInternal(float elapsedSeconds, AdvanceFlags flags)
             didUpdate = true;
         }
     }
-    for (auto dataBind : m_DataBinds)
+    if (advanceDataBinds(elapsedSeconds))
     {
-        if (dataBind->advance(elapsedSeconds))
-        {
-            didUpdate = true;
-        }
+        didUpdate = true;
     }
 
     return didUpdate;
@@ -1565,23 +1543,14 @@ void Artboard::internalDataContext(DataContext* value)
             artboardHost->internalDataContext(m_DataContext);
         }
     }
-    for (auto dataBind : m_DataBinds)
-    {
-        if (dataBind->is<DataBindContext>())
-        {
-            dataBind->as<DataBindContext>()->bindFromContext(m_DataContext);
-        }
-    }
+    bindDataBindsFromContext(m_DataContext);
     sortDataBinds();
 }
 
 void Artboard::unbind()
 {
     clearDataContext();
-    for (auto& dataBind : m_DataBinds)
-    {
-        dataBind->unbind();
-    }
+    unbindDataBinds();
     for (auto artboardHost : m_ArtboardHosts)
     {
         artboardHost->unbind();
@@ -1602,24 +1571,6 @@ void Artboard::clearDataContext()
     }
 }
 
-void Artboard::sortDataBinds()
-{
-    size_t currentToSourceIndex = 0;
-    for (size_t i = 0; i < m_DataBinds.size(); i++)
-    {
-        if (m_DataBinds[i]->toSource())
-        {
-            if (i != currentToSourceIndex)
-            {
-
-                std::iter_swap(m_DataBinds.begin() + currentToSourceIndex,
-                               m_DataBinds.begin() + i);
-            }
-            currentToSourceIndex += 1;
-        }
-    }
-}
-
 float Artboard::volume() const { return m_volume; }
 void Artboard::volume(float value)
 {
@@ -1635,11 +1586,6 @@ void Artboard::volume(float value)
             }
         }
     }
-}
-
-void Artboard::addDataBind(DataBind* dataBind)
-{
-    m_DataBinds.push_back(dataBind);
 }
 
 void Artboard::dataContext(DataContext* value) { internalDataContext(value); }
@@ -1666,7 +1612,7 @@ void Artboard::bindViewModelInstance(rcp<ViewModelInstance> viewModelInstance,
 
 bool Artboard::isAncestor(const Artboard* artboard)
 {
-    if (m_artboardSource == artboard)
+    if (artboard != nullptr && m_artboardSource == artboard->artboardSource())
     {
         return true;
     }
